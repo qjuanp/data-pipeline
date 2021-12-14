@@ -1,1 +1,0 @@
-record Entry(Guid Id, DateTime Created, string Message);
