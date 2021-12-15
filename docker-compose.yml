@@ -10,6 +10,8 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - hbase
 
   broker:
     image: confluentinc/cp-kafka:7.0.0
@@ -32,6 +34,8 @@ services:
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_JMX_PORT: 9101
       KAFKA_JMX_HOSTNAME: localhost
+    networks:
+      - hbase
 
   schema-registry:
     image: confluentinc/cp-schema-registry:7.0.0
@@ -45,9 +49,11 @@ services:
       SCHEMA_REGISTRY_HOST_NAME: schema-registry
       SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: 'broker:29092'
       SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    networks:
+      - hbase
 
   connect:
-    image: cnfldemos/kafka-connect-datagen:0.5.0-6.2.0 # TODO: use the built solution here
+    image: confluentinc/cp-kafka-connect:7.0.0
     hostname: connect
     container_name: connect
     depends_on:
@@ -72,6 +78,8 @@ services:
       CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
       CONNECT_PLUGIN_PATH: "/usr/share/java,/usr/share/confluent-hub-components"
       CONNECT_LOG4J_LOGGERS: org.apache.zookeeper=ERROR,org.I0Itec.zkclient=ERROR,org.reflections=ERROR
+    networks:
+      - hbase
     command: 
       - bash 
       - -c 
@@ -99,18 +107,130 @@ services:
             -d '{
               "name": "hdfs3-event-added",
               "config": {
-              "connector.class": "io.confluent.connect.hdfs3.Hdfs3SinkConnector",
-              "tasks.max": "1",
-              "topics": "entry-added",
-              "hdfs.url": "hdfs://localhost:9000",
-              "flush.size": "3",
-              "key.converter": "org.apache.kafka.connect.storage.StringConverter",
-              "value.converter": "io.confluent.connect.avro.AvroConverter",
-              "value.converter.schema.registry.url":"http://localhost:8081",
-              "confluent.topic.bootstrap.servers": "localhost:9092",
-              "confluent.topic.replication.factor": "1",
+                "connector.class": "io.confluent.connect.hdfs3.Hdfs3SinkConnector",
+                "tasks.max": "1",
+                "topics": "entry-added",
+                "hdfs.url": "hdfs://namenode:9000",
+                "flush.size": "3",
+                "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+                "value.converter": "io.confluent.connect.avro.AvroConverter",
+                "value.converter.schema.registry.url":"http://schema-registry:8081",
+                "confluent.topic.bootstrap.servers": "broker:9092",
+                "confluent.topic.replication.factor": "1",
 
-              "format.class":"io.confluent.connect.hdfs3.parquet.ParquetFormat",
-              "partitioner.class":"io.confluent.connect.storage.partitioner.FieldPartitioner",
-              "partition.field.name":"is_customer"
+                "format.class":"io.confluent.connect.hdfs3.parquet.ParquetFormat",
+                "partitioner.class":"io.confluent.connect.storage.partitioner.FieldPartitioner",
+                "partition.field.name":"is_customer"
+              }
             }'
+
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.3.1-java8
+    container_name: namenode
+    restart: always
+    ports:
+      - 9870:9870
+      - 9000:9000
+    volumes:
+      - hadoop_namenode:/hadoop/dfs/name
+    environment:
+      - CLUSTER_NAME=test
+    env_file:
+      - ./hadoop-hive.env 
+    networks:
+      - hbase
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.3.1-java8
+    container_name: datanode
+    restart: always
+    volumes:
+      - hadoop_datanode:/hadoop/dfs/data
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870"
+    ports:
+      - 9864:9864
+    env_file:
+      - ./hadoop-hive.env
+    networks:
+      - hbase
+  
+  resourcemanager:
+    image: bde2020/hadoop-resourcemanager:2.0.0-hadoop3.3.1-java8
+    container_name: resourcemanager
+    restart: always
+    environment:
+      SERVICE_PRECONDITION: "namenode:9000 namenode:9870 datanode:9864"
+    env_file:
+      - ./hadoop-hive.env
+    networks:
+      - hbase
+
+  nodemanager1:
+    image: bde2020/hadoop-nodemanager:2.0.0-hadoop3.3.1-java8
+    container_name: nodemanager
+    restart: always
+    environment:
+      SERVICE_PRECONDITION: "namenode:9000 namenode:9870 datanode:9864 resourcemanager:8088"
+    env_file:
+      - ./hadoop-hive.env
+    networks:
+      - hbase
+  
+  historyserver:
+    image: bde2020/hadoop-historyserver:2.0.0-hadoop3.3.1-java8
+    container_name: historyserver
+    restart: always
+    environment:
+      SERVICE_PRECONDITION: "namenode:9000 namenode:9870 datanode:9864 resourcemanager:8088"
+    volumes:
+      - hadoop_historyserver:/hadoop/yarn/timeline
+    env_file:
+      - ./hadoop-hive.env
+    networks:
+      - hbase
+
+  hive-server:
+    image: bde2020/hive:3.1.2
+    container_name: hiveserver
+    env_file:
+      - ./hadoop-hive.env
+    networks:
+      - hbase
+    environment:
+      HIVE_CORE_CONF_javax_jdo_option_ConnectionURL: "jdbc:postgresql://hivemetastore:5432/metastore"
+      SERVICE_PRECONDITION: "hivemetastore:9083"
+    ports:
+      - 10000:10000
+
+  hive-metastore:
+    image: bde2020/hive:3.1.2
+    container_name: hivemetastore
+    env_file:
+      - ./hadoop-hive.env
+    networks:
+      - hbase
+    command: /opt/hive/bin/hive --service metastore
+    environment:
+      SERVICE_PRECONDITION: "namenode:9000 datanode:9864 hivemetastorepostgresql:5432"
+    ports:
+      - 9083:9083
+
+  hive-metastore-postgresql:
+    image: bde2020/hive-metastore-postgresql:3.1.2
+    container_name: hivemetastorepostgresql
+    env_file:
+      - ./hadoop-hive.env
+    networks:
+      - hbase
+    ports:
+      - 5432:5432
+
+volumes:
+  hadoop_namenode:
+  hadoop_datanode:
+  hadoop_historyserver:
+
+networks:
+  hbase:
+    name: hbase
